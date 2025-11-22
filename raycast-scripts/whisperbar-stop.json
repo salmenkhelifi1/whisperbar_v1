@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "title": "WhisperBar Stop",
+  "description": "Stop WhisperBar speech-to-text application",
+  "mode": "no-view",
+  "icon": "🛑",
+  "packageName": "WhisperBar"
+}
+

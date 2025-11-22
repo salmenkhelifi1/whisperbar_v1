@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "title": "WhisperBar Restart",
+  "description": "Restart WhisperBar speech-to-text application",
+  "mode": "no-view",
+  "icon": "🔄",
+  "packageName": "WhisperBar",
+  "currentDirectoryPath": "/Users/salmenkhelifi/Documents/whisperbar_v1"
+}
+

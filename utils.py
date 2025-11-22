@@ -106,7 +106,6 @@ def get_model_info(model_name):
     # Estimated sizes (these are approximate)
     size_map = {
         "distil-whisper/distil-tiny.en": "37 MB",
-        "distil-whisper/distil-small.en": "244 MB", 
         "distil-whisper/distil-medium.en": "769 MB",
         "distil-whisper/distil-large-v3.5": "1.5 GB",
     }

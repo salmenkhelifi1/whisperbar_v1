@@ -21,15 +21,26 @@ SAMPLE_RATE = 16000  # Whisper expects 16kHz audio
 CHANNELS = 1
 TEMP_FILE_PATH = "temp_recording.wav"
 
+# Audio Input Device Selection
+# Always uses built-in MacBook microphone (input only, no system audio)
+# AUTO_DETECT_BUILTIN_MIC will automatically find and use MacBook built-in microphone
+AUTO_DETECT_BUILTIN_MIC = True  # Automatically use built-in MacBook microphone (RECOMMENDED)
+AUDIO_INPUT_DEVICE = None  # None = auto-detect built-in mic, or device index (int) for manual selection
+# Note: Only microphone input devices are used - system audio/output is never used
+
+# Audio Handling Options
+AUTO_PAUSE_MEDIA = True  # Automatically pause music/video when recording starts
+RESUME_MEDIA_AFTER_RECORDING = True  # Resume media after recording stops
+SHARE_MIC_DURING_CALLS = True  # Allow recording while in calls (may not work with all apps)
+DETECT_AUDIO_CONFLICTS = True  # Warn if audio conflicts detected
+
 # --- Model Configuration ---
 MODEL_MAP = {
     "Tiny (.en)": "openai/whisper-tiny.en",  # Real tiny model for ultra-fast processing
-    "Small (.en)": "distil-whisper/distil-small.en", 
-    "Medium (.en)": "distil-whisper/distil-medium.en",
-    "Large (v3.5)": "distil-whisper/distil-large-v3.5",
+    # Large, Medium, and Small models removed for faster, lighter operation
 }
-# Use Medium for best balanced performance with Optimized mode
-DEFAULT_MODEL_NAME = "Medium (.en)"  # Best balance with smart processing
+# Use Tiny for lightest model with Optimized mode
+DEFAULT_MODEL_NAME = "Tiny (.en)"  # Lightest model for fastest processing
 
 # --- Smart Model Selection ---
 # Automatically use different models based on recording length
@@ -37,8 +48,8 @@ ADAPTIVE_MODEL_SELECTION = False  # Disabled for consistency
 MODEL_SELECTION_RULES = {
     # Recording length (seconds): Model to use
     0.0: "Tiny (.en)",     # Very short clips: use fastest
-    3.0: "Small (.en)",    # Medium clips: balanced
-    10.0: "Small (.en)",   # Longer clips: stick with Small for consistency
+    3.0: "Tiny (.en)",     # Medium clips: use fastest
+    10.0: "Tiny (.en)",    # Longer clips: use fastest
 }
 
 # --- Audio Quality Optimizations ---
@@ -67,13 +78,25 @@ GENERATION_PROFILES = {
 DEFAULT_PROFILE = "balanced"
 
 # --- Keyboard Configuration ---
-# Available options: keyboard.Key.shift_r, keyboard.Key.shift_l, 
-# keyboard.Key.space, keyboard.Key.ctrl, etc.
-TRIGGER_KEY = keyboard.Key.shift_r
+# Customizable keyboard shortcuts (string format)
+# Format: "alt_r" for single key, "cmd+shift+w" for combinations
+# Available modifiers: cmd, shift, ctrl, alt, option
+# Available keys: f1-f12, space, enter, a-z, 0-9, alt_l, alt_r, shift_l, shift_r, fn, etc.
+TRIGGER_KEY = "alt_r"  # Primary push-to-talk key (hold to record)
+TRIGGER_KEY_2 = "shift_l"  # Secondary push-to-talk key (left shift - hold to record)
+# Both keys work simultaneously - you can use either alt_r or shift_l to trigger recording
+# To disable secondary key, set to None or "none"
+TOGGLE_RECORDING_KEY = "cmd+shift+w"  # Toggle recording on/off (without holding)
+QUIT_APP_KEY = "cmd+shift+q"  # Quit application
+RELOAD_MODEL_KEY = "cmd+shift+r"  # Reload current model
+TOGGLE_APP_KEY = "cmd+shift+t"  # Enable/disable app (without quitting)
 
 # --- Processing Configuration ---
 MAX_RECORDING_DURATION = 15  # seconds (shorter for faster processing)
-PASTE_DELAY = 0.3  # seconds to wait before pasting (faster)
+PASTE_DELAY = 0.15  # seconds to wait before pasting (ensures window is ready and cursor is positioned)
+ENABLE_DIRECT_PASTE = True  # Direct paste at cursor position (PRODUCTION: Always enabled - paste directly at text cursor in any input field)
+PASTE_RETRY_ATTEMPTS = 5  # Number of retry attempts for paste (increased for better reliability)
+FORCE_DIRECT_PASTE = True  # Force direct paste - always try to paste at cursor position, not just copy to clipboard
 CLIPBOARD_FALLBACK = True  # Copy to clipboard if paste fails
 OPTIMIZE_FOR_SPEED = True  # Enable speed optimizations
 
@@ -85,7 +108,7 @@ VAD_MIN_SPEECH_DURATION = 0.3  # Minimum speech segment length (seconds)
 VAD_MIN_SILENCE_DURATION = 0.5  # Minimum silence to split segments (seconds)
 VAD_SPEECH_PAD_BEFORE = 0.3  # Padding before speech (seconds) - increased for better capture
 VAD_SPEECH_PAD_AFTER = 0.2   # Padding after speech (seconds)
-VAD_SHOW_FEEDBACK = True     # Show VAD detection in status bar
+VAD_SHOW_FEEDBACK = False    # Show VAD detection in status bar (PRODUCTION: Disabled for cleaner UI)
 
 # --- Processing Mode Configuration ---
 # Three clean processing modes:
@@ -93,7 +116,7 @@ VAD_SHOW_FEEDBACK = True     # Show VAD detection in status bar
 # 2. Optimized: Smart segmentation + user's model choice  
 # 3. Ultra-Fast: Forces Tiny model + smart optimization
 
-PROCESSING_MODE = "Optimized"  # Default to smart processing for best balance
+PROCESSING_MODE = "Optimized"
 
 # Smart Optimization Settings (used by Optimized and Ultra-Fast modes)
 SMART_MAX_SEGMENT_LENGTH = 8.0  # Split long recordings at 8s for parallel processing
@@ -139,5 +162,40 @@ AUDIO_GAIN = 1.0  # Multiply audio volume by this factor
 
 # UI Settings
 SHOW_NOTIFICATIONS = True
-NOTIFICATION_DURATION = 3  # seconds
-HIDE_FROM_DOCK = True  # Set to False if you want the app to appear in dock 
+NOTIFICATION_DURATION = 2  # seconds (PRODUCTION: Reduced from 3 to 2)
+HIDE_FROM_DOCK = True  # Set to False if you want the app to appear in dock
+
+# --- Production Optimizations ---
+# Reduce VAD feedback for cleaner production experience
+VAD_SHOW_FEEDBACK = False  # Disable VAD feedback in status bar (PRODUCTION: Cleaner UI)
+
+# --- Cloud API Configuration ---
+USE_CLOUD_API = False  # Set to True to use cloud APIs instead of local models
+CLOUD_PROVIDER = "openai"  # Options: "openai", "google", "deepgram", "custom"
+
+# API Keys (set via environment variables or here - NOT RECOMMENDED for security)
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', '')
+DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY', '')
+
+# Custom API Configuration
+CUSTOM_API_URL = os.getenv('CUSTOM_API_URL', '')
+CUSTOM_API_HEADERS = {}  # Additional headers as dict, e.g., {"X-Custom-Header": "value"}
+CUSTOM_API_AUTH = "bearer"  # Options: "bearer", "api_key", "basic"
+
+# Cloud API Timeout (seconds)
+CLOUD_API_TIMEOUT = 30
+
+# --- Memory and Battery Optimizations ---
+ENABLE_LOW_POWER_MODE = True  # Reduces CPU usage when idle (PRODUCTION: Enabled for battery life)
+LAZY_MODEL_LOADING = True  # Only load model when first recording starts (PRODUCTION: Faster startup)
+AUTO_UNLOAD_MODELS = True  # Unload models when not in use to save memory (PRODUCTION: Enabled)
+IDLE_QUEUE_CHECK_INTERVAL = 2.0  # Seconds between queue checks when idle (battery optimization)
+DISABLE_BACKGROUND_PRELOADING = True  # Don't preload models in background (saves battery)
+
+# --- Production Mode Settings ---
+PRODUCTION_MODE = True  # Enable production optimizations (reduces logging, optimizes performance)
+VERBOSE_LOGGING = False  # Set to False for production (reduces console output)
+SHOW_DEBUG_INFO = False  # Hide debug information in production
+ENABLE_PERFORMANCE_MONITORING = False  # Disable performance monitoring in production (saves resources) 
