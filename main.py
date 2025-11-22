@@ -154,11 +154,17 @@ cancel_processing_event = threading.Event()
 shortcut_manager = None
 modifier_keys_pressed = set()  # Track pressed modifier keys
 
-# Streaming processing state
-streaming_buffer = []
-streaming_thread = None
-streaming_enabled = False
-STREAMING_CHUNK_DURATION = 2.0  # Process every 2 seconds
+# Live/Streaming transcription state
+live_transcription_enabled = False
+live_transcription_thread = None
+live_transcription_buffer = []
+live_transcription_lock = threading.Lock()
+live_transcription_results = []  # Accumulated transcription results
+live_last_paste_time = 0
+
+# Optimized Faster Whisper model for live transcription (loaded once, reused)
+live_faster_whisper_model = None
+live_faster_whisper_model_lock = threading.Lock()
 
 # Keyboard Controller
 keyboard_controller = Controller() # Instantiate the controller
@@ -487,6 +493,628 @@ def process_segments_sequential(segments, audio_data_np):
         
     except Exception as e:
         print(f"[Error] Sequential processing failed: {e}")
+        return ""
+
+def load_live_faster_whisper_model():
+    """Load optimized Faster Whisper model for live transcription with intelligence.
+    
+    Uses medium.en for best accuracy/intelligence, falls back to base.en if too slow.
+    This provides the best balance of speed and intelligence for live transcription.
+    
+    Returns:
+        WhisperModel instance or None if loading fails
+    """
+    global live_faster_whisper_model
+    
+    # Check if model is already loaded
+    if live_faster_whisper_model is not None:
+        return live_faster_whisper_model
+    
+    if not FASTER_WHISPER_AVAILABLE:
+        log_warning("[Live] faster-whisper not available")
+        return None
+    
+    with live_faster_whisper_model_lock:
+        # Double-check after acquiring lock
+        if live_faster_whisper_model is not None:
+            return live_faster_whisper_model
+        
+        try:
+            from config import LIVE_PRIMARY_MODEL, LIVE_FALLBACK_MODEL, LIVE_USE_HYBRID_MODELS
+            
+            # Determine device and compute type for optimal performance
+            device = "cpu"
+            compute_type = "int8"  # Fast with good accuracy
+            
+            if torch.backends.mps.is_available():
+                device = "cpu"
+                compute_type = "int8"
+                log_info("[Live] Using CPU with int8 quantization (optimal for M1/M2 Macs)")
+            elif torch.cuda.is_available():
+                device = "cuda"
+                compute_type = "float16"  # Better accuracy on CUDA
+                log_info("[Live] Using CUDA with float16")
+            else:
+                device = "cpu"
+                compute_type = "int8"
+                log_info("[Live] Using CPU with int8 quantization")
+            
+            # Try primary model first (medium.en for best intelligence)
+            if LIVE_USE_HYBRID_MODELS:
+                model_name = LIVE_PRIMARY_MODEL  # Usually "medium.en"
+                log_info(f"[Live] Loading intelligent Faster Whisper model: {model_name} (best accuracy)...")
+            else:
+                model_name = "base.en"
+                log_info(f"[Live] Loading Faster Whisper model: {model_name}...")
+            
+            try:
+                # Load the primary model with aggressive optimizations
+                model = WhisperModel(
+                    model_name,
+                    device=device,
+                    compute_type=compute_type,
+                    num_workers=1,  # Single worker for lower latency
+                    cpu_threads=2,  # Use 2 threads for better CPU utilization
+                )
+                
+                live_faster_whisper_model = model
+                log_info(f"[Live] ✅ Faster Whisper {model_name} loaded successfully (intelligent mode)")
+                return model
+                
+            except Exception as primary_error:
+                log_warning(f"[Live] Failed to load {model_name}, trying fallback: {primary_error}")
+                
+                # Fallback to faster model if primary is too slow
+                fallback_name = LIVE_FALLBACK_MODEL if LIVE_USE_HYBRID_MODELS else "base.en"
+                log_info(f"[Live] Loading fallback model: {fallback_name} (faster, still accurate)...")
+                
+                try:
+                    model = WhisperModel(
+                        fallback_name,
+                        device=device,
+                        compute_type=compute_type,
+                        num_workers=1,
+                        cpu_threads=2,
+                    )
+                    
+                    live_faster_whisper_model = model
+                    log_info(f"[Live] ✅ Faster Whisper {fallback_name} loaded successfully")
+                    return model
+                except Exception as fallback_error:
+                    log_error(f"[Live] Failed to load fallback model: {fallback_error}")
+                    return None
+            
+        except Exception as e:
+            log_error(f"[Live] Failed to load Faster Whisper model: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+def faster_transcribe_chunk(audio_chunk, model_instance=None):
+    """Fast and intelligent transcription of an audio chunk using Faster Whisper.
+    
+    This is the core inference function optimized for real-time live transcription.
+    Uses optimized beam_size and language="en" for best speed and accuracy balance.
+    
+    Args:
+        audio_chunk: numpy array of audio samples (float32, 16kHz, mono)
+        model_instance: Optional WhisperModel instance (if None, loads automatically)
+    
+    Returns:
+        str: Transcribed text, or empty string if transcription fails
+    """
+    global live_faster_whisper_model
+    
+    try:
+        # Ensure audio is in correct format
+        if not isinstance(audio_chunk, np.ndarray):
+            log_warning("[Live] Audio chunk must be numpy array")
+            return ""
+        
+        # Ensure correct shape and dtype
+        if audio_chunk.ndim > 1:
+            audio_chunk = audio_chunk.squeeze()
+        audio_chunk = audio_chunk.astype(np.float32)
+        
+        # Validate audio length
+        if len(audio_chunk) < 1600:  # Less than 0.1 seconds at 16kHz
+            return ""  # Too short to transcribe
+        
+        # Get model instance (load if needed)
+        if model_instance is None:
+            model_instance = load_live_faster_whisper_model()
+            if model_instance is None:
+                log_warning("[Live] Faster Whisper model not available")
+                return ""
+        
+        # Optimized transcription settings for speed + intelligence
+        # beam_size=2 for faster processing (still accurate with medium.en model)
+        # language="en" ensures English-only processing (faster)
+        # task="transcribe" explicitly sets transcription task
+        # vad_filter=False since we're already using Silero VAD
+        try:
+            segments, info = model_instance.transcribe(
+                audio_chunk,
+                beam_size=2,  # Reduced from 3 for speed (medium.en is accurate enough with beam_size=2)
+                language="en",  # English-only for maximum performance
+                task="transcribe",
+                vad_filter=False,  # We handle VAD separately with Silero
+                condition_on_previous_text=False,  # Faster, no context dependency
+                initial_prompt=None,  # No prompt for faster processing
+                word_timestamps=False,  # Disable for speed
+                temperature=0.0,  # Deterministic, faster
+                best_of=1,  # Don't try multiple candidates (faster)
+                patience=1.0,  # Lower patience for faster decoding
+            )
+            
+            # Collect transcribed text from segments
+            text_parts = []
+            for segment in segments:
+                segment_text = segment.text.strip()
+                if segment_text:
+                    text_parts.append(segment_text)
+            
+            # Combine all segments
+            full_text = ' '.join(text_parts).strip()
+            
+            return full_text
+            
+        except Exception as transcribe_error:
+            log_warning(f"[Live] Transcription call error: {transcribe_error}")
+            # Try with even simpler settings as fallback
+            try:
+                segments, info = model_instance.transcribe(
+                    audio_chunk,
+                    beam_size=1,  # Greedy decoding (fastest)
+                    language="en",
+                    task="transcribe",
+                    vad_filter=False,
+                )
+                text_parts = []
+                for segment in segments:
+                    text_parts.append(segment.text.strip())
+                return ' '.join(text_parts).strip()
+            except:
+                return ""
+        
+    except Exception as e:
+        log_warning(f"[Live] Transcription error in faster_transcribe_chunk: {e}")
+        # Don't print full traceback in production to avoid spam
+        if not PRODUCTION_MODE:
+            import traceback
+            traceback.print_exc()
+        return ""
+
+def process_live_transcription_chunk():
+    """Process a chunk of audio for live transcription - optimized for real-time with smart silence detection."""
+    global live_transcription_buffer, live_transcription_results, live_last_paste_time
+    global live_faster_whisper_model
+    
+    try:
+        from config import (LIVE_CHUNK_DURATION, LIVE_MIN_SPEECH_DURATION, 
+                           LIVE_SILENCE_THRESHOLD, LIVE_PASTE_INCREMENTALLY, LIVE_PASTE_DELAY,
+                           LIVE_SKIP_SILENCE, LIVE_MIN_SILENCE_DURATION)
+        
+        # Get audio chunk from buffer with crash prevention
+        try:
+            with live_transcription_lock:
+                if not live_transcription_buffer:
+                    return ""
+                
+                # Collect enough audio for processing (LIVE_CHUNK_DURATION seconds)
+                samples_needed = int(LIVE_CHUNK_DURATION * SAMPLE_RATE)
+                chunk_frames = []
+                total_samples = 0
+                
+                # CRASH PREVENTION: Limit iterations to prevent infinite loops
+                max_iterations = 100
+                iteration = 0
+                
+                while live_transcription_buffer and total_samples < samples_needed and iteration < max_iterations:
+                    try:
+                        frame = live_transcription_buffer.pop(0)
+                        if frame is not None and len(frame) > 0:
+                            chunk_frames.append(frame)
+                            total_samples += len(frame)
+                        iteration += 1
+                    except (IndexError, AttributeError):
+                        break  # Buffer empty or frame invalid
+                
+                if not chunk_frames:
+                    return ""
+                
+                # Combine frames into single array with error handling
+                try:
+                    chunk_audio = np.concatenate(chunk_frames, axis=0)
+                    if chunk_audio.ndim > 1:
+                        chunk_audio = chunk_audio.squeeze()
+                    chunk_audio = chunk_audio.astype(np.float32)
+                except Exception as concat_error:
+                    log_warning(f"[Live] Audio concatenation error: {concat_error}")
+                    return ""
+        except Exception as buffer_error:
+            log_warning(f"[Live] Buffer access error: {buffer_error}")
+            return ""
+        
+        # SMART SILENCE DETECTION: Quick energy check before VAD (faster, saves CPU)
+        if LIVE_SKIP_SILENCE:
+            try:
+                # Calculate RMS (Root Mean Square) energy of the audio chunk
+                audio_energy = np.sqrt(np.mean(chunk_audio ** 2))
+                # Normalize energy threshold (adjust based on typical speech levels)
+                energy_threshold = 0.01  # Very low threshold - only skip if truly silent
+                
+                if audio_energy < energy_threshold:
+                    # Very low energy - likely silence, skip processing
+                    log_info("[Live] 🔇 Silence detected, skipping processing (saves CPU)")
+                    return ""
+            except:
+                pass  # If energy check fails, continue with VAD
+        
+        # Use VAD to detect speech in this chunk
+        try:
+            from config import VAD_SPEECH_PAD_BEFORE, VAD_SPEECH_PAD_AFTER
+            import torch
+            
+            if vad_model is None:
+                # No VAD, process entire chunk
+                speech_segments = [(0, len(chunk_audio))]
+            else:
+                audio_tensor = torch.from_numpy(chunk_audio)
+                get_speech_timestamps = vad_model['utils'][0]
+                speech_timestamps = get_speech_timestamps(
+                    audio_tensor,
+                    vad_model['model'],
+                    sampling_rate=SAMPLE_RATE,
+                    threshold=LIVE_SILENCE_THRESHOLD,  # Use live-specific threshold (higher = more aggressive)
+                    min_speech_duration_ms=int(LIVE_MIN_SPEECH_DURATION * 1000),
+                    min_silence_duration_ms=int(LIVE_MIN_SILENCE_DURATION * 1000),  # Use configurable silence duration
+                    return_seconds=False
+                )
+                
+                if not speech_timestamps:
+                    # No speech detected by VAD - skip processing
+                    if LIVE_SKIP_SILENCE:
+                        log_info("[Live] 🔇 No speech detected by VAD, skipping (saves CPU)")
+                    return ""
+                
+                # Convert to sample indices
+                speech_segments = []
+                for segment in speech_timestamps:
+                    start_sample = max(0, segment['start'] - int(VAD_SPEECH_PAD_BEFORE * SAMPLE_RATE))
+                    end_sample = min(len(chunk_audio), segment['end'] + int(VAD_SPEECH_PAD_AFTER * SAMPLE_RATE))
+                    speech_segments.append((start_sample, end_sample))
+        except Exception as vad_error:
+            log_warning(f"[Live] VAD error: {vad_error}, processing entire chunk")
+            speech_segments = [(0, len(chunk_audio))]
+        
+        # Transcribe each speech segment
+        transcribed_texts = []
+        for start_idx, end_idx in speech_segments:
+            segment_audio = chunk_audio[start_idx:end_idx]
+            segment_duration = len(segment_audio) / SAMPLE_RATE
+            
+            if segment_duration < LIVE_MIN_SPEECH_DURATION:
+                continue  # Skip too short segments
+            
+            try:
+                # Use optimized Faster Whisper for live transcription
+                # This uses base.en or small.en with beam_size=3 for optimal speed/accuracy
+                text = faster_transcribe_chunk(segment_audio, model_instance=live_faster_whisper_model)
+                
+                if text:
+                    transcribed_texts.append(text)
+            except Exception as transcribe_error:
+                log_warning(f"[Live] Transcription error: {transcribe_error}")
+                continue
+        
+        if not transcribed_texts:
+            return ""
+        
+        # Combine transcribed texts
+        combined_text = ' '.join(transcribed_texts).strip()
+        combined_text = ' '.join(combined_text.split())  # Clean whitespace
+        
+        # Debug: Log transcription result
+        if combined_text:
+            log_info(f"[Live] 🎤 Transcribed: '{combined_text[:60]}...'")
+        
+        # Add to results
+        live_transcription_results.append(combined_text)
+        
+        # Paste incrementally if enabled
+        if LIVE_PASTE_INCREMENTALLY and combined_text:
+            import time
+            current_time = time.time()
+            if current_time - live_last_paste_time >= LIVE_PASTE_DELAY:
+                try:
+                    log_info(f"[Live] 📋 Attempting to paste: '{combined_text[:50]}...'")
+                    
+                    # Copy to clipboard first
+                    pyperclip.copy(combined_text)
+                    time.sleep(0.3)  # Wait for clipboard to be ready
+                    
+                    # Verify clipboard
+                    clipboard_check = pyperclip.paste()
+                    if clipboard_check != combined_text and clipboard_check[:50] != combined_text[:50]:
+                        log_warning("[Live] Clipboard copy failed, retrying...")
+                        pyperclip.copy(combined_text)
+                        time.sleep(0.2)
+                    
+                    # Enhanced paste script with better reliability
+                    import subprocess
+                    
+                    # Method 1: Activate app and paste (most reliable)
+                    paste_script = '''
+                        tell application "System Events"
+                            set frontApp to name of first application process whose frontmost is true
+                            tell process frontApp
+                                activate
+                                set frontmost to true
+                                delay 0.5
+                                keystroke "v" using {command down}
+                                delay 0.2
+                            end tell
+                        end tell
+                    '''
+                    
+                    # Try paste with verification
+                    paste_result = subprocess.run(['osascript', '-e', paste_script], 
+                                         check=False, timeout=5, capture_output=True)
+                    
+                    if paste_result.returncode == 0:
+                        live_last_paste_time = current_time
+                        log_info(f"[Live] ✅ Pasted successfully: '{combined_text[:50]}...'")
+                    else:
+                        # Fallback: Try simpler paste method
+                        log_warning(f"[Live] Primary paste failed (code {paste_result.returncode}), trying fallback...")
+                        try:
+                            fallback_script = '''
+                                tell application "System Events"
+                                    delay 0.3
+                                    keystroke "v" using {command down}
+                                end tell
+                            '''
+                            fallback_result = subprocess.run(['osascript', '-e', fallback_script], 
+                                         check=False, timeout=3, capture_output=True)
+                            if fallback_result.returncode == 0:
+                                live_last_paste_time = current_time
+                                log_info(f"[Live] ✅ Pasted (fallback): '{combined_text[:50]}...'")
+                            else:
+                                log_warning(f"[Live] Fallback paste also failed (code {fallback_result.returncode})")
+                        except Exception as fallback_error:
+                            log_warning(f"[Live] Fallback paste error: {fallback_error}")
+                except Exception as paste_error:
+                    log_warning(f"[Live] Paste error: {paste_error}")
+                    import traceback
+                    if not PRODUCTION_MODE:
+                        traceback.print_exc()
+        
+        return combined_text
+        
+    except Exception as e:
+        log_warning(f"[Live] Processing error: {e}")
+        return ""
+
+def live_transcription_worker():
+    """Worker thread for live transcription - processes audio chunks continuously with smart silence detection and crash prevention."""
+    global live_transcription_enabled, is_recording
+    
+    error_count = 0
+    max_errors = 10  # Increased max errors for better stability
+    consecutive_errors = 0
+    
+    try:
+        from config import LIVE_CHUNK_DURATION, LIVE_SKIP_SILENCE
+        
+        log_info("[Live] 🎙️ Live transcription started (smart silence detection + crash prevention)")
+        
+        consecutive_silence_count = 0  # Track consecutive silent chunks
+        max_silence_before_sleep = 3  # After 3 silent chunks, sleep longer
+        
+        while True:  # Keep running until explicitly stopped
+            try:
+                # CRASH PREVENTION: Check if we should continue
+                if not live_transcription_enabled:
+                    log_info("[Live] Live transcription disabled, exiting worker")
+                    break
+                
+                if not is_recording:
+                    # Recording stopped, but keep worker alive in case recording restarts
+                    time.sleep(0.5)
+                    continue
+                
+                # Process chunk with comprehensive error handling
+                try:
+                    # CRASH PREVENTION: Ensure model is loaded before processing
+                    if live_faster_whisper_model is None:
+                        try:
+                            live_faster_whisper_model = load_live_faster_whisper_model()
+                            if live_faster_whisper_model is None:
+                                # Model still not loaded, wait a bit and skip this chunk
+                                time.sleep(0.5)
+                                continue
+                        except Exception as model_load_error:
+                            log_warning(f"[Live] Model load error: {model_load_error}")
+                            time.sleep(1.0)
+                            continue
+                    
+                    result = process_live_transcription_chunk()
+                    error_count = 0  # Reset error count on success
+                    consecutive_errors = 0
+                except KeyboardInterrupt:
+                    raise  # Re-raise keyboard interrupt
+                except Exception as process_error:
+                    consecutive_errors += 1
+                    error_count += 1
+                    
+                    # Only log every 5th error to avoid spam
+                    if consecutive_errors % 5 == 1:
+                        log_warning(f"[Live] Chunk processing error ({consecutive_errors} consecutive): {str(process_error)[:100]}")
+                    
+                    # Don't give up easily - just wait and retry
+                    if consecutive_errors >= max_errors:
+                        log_error(f"[Live] Too many consecutive errors ({consecutive_errors}), waiting longer before retry")
+                        time.sleep(2.0)  # Wait longer before retrying
+                        consecutive_errors = 0  # Reset counter after long wait
+                    else:
+                        time.sleep(0.3)  # Short wait before retry
+                    continue
+                
+                if result:
+                    # Speech detected - reset silence counter
+                    consecutive_silence_count = 0
+                    
+                    # Update status (with error handling)
+                    try:
+                        status_queue.put(f"{APP_ICON_TRANSCRIBING} 🎙️ Live: {result[:40]}...")
+                    except Exception as status_error:
+                        # Don't let status update errors crash the worker
+                        pass
+                else:
+                    # No speech detected (silence)
+                    if LIVE_SKIP_SILENCE:
+                        consecutive_silence_count += 1
+                        
+                        # If many consecutive silent chunks, sleep longer to save CPU
+                        if consecutive_silence_count >= max_silence_before_sleep:
+                            # Sleep longer during extended silence
+                            time.sleep(LIVE_CHUNK_DURATION * 1.5)
+                            consecutive_silence_count = 0  # Reset after long sleep
+                            continue
+                
+                # Wait before next chunk (shorter wait if we just processed speech)
+                if result:
+                    # Just processed speech - check again soon
+                    time.sleep(LIVE_CHUNK_DURATION * 0.25)  # Faster response
+                else:
+                    # Silence detected - wait a bit longer
+                    time.sleep(LIVE_CHUNK_DURATION * 0.6)
+                
+            except KeyboardInterrupt:
+                log_info("[Live] Worker interrupted by user")
+                break
+            except Exception as chunk_error:
+                consecutive_errors += 1
+                error_count += 1
+                
+                # Only log every 5th error
+                if consecutive_errors % 5 == 1:
+                    log_warning(f"[Live] Worker loop error ({consecutive_errors} consecutive): {chunk_error}")
+                
+                # Don't give up - just wait and continue
+                if consecutive_errors >= max_errors:
+                    log_error(f"[Live] Too many consecutive errors ({consecutive_errors}), waiting longer")
+                    time.sleep(2.0)
+                    consecutive_errors = 0
+                else:
+                    time.sleep(0.5)
+        
+        log_info("[Live] 🎙️ Live transcription worker stopped")
+        
+    except Exception as e:
+        log_error(f"[Live] Worker thread fatal error: {e}")
+        # Don't print full traceback in production
+        if not PRODUCTION_MODE:
+            import traceback
+            traceback.print_exc()
+    finally:
+        # CRASH PREVENTION: Ensure state is clean
+        try:
+            # Don't set live_transcription_enabled = False here
+            # Let the stop function handle that
+            pass
+        except:
+            pass
+
+def start_live_transcription():
+    """Start live transcription processing with crash prevention."""
+    global live_transcription_enabled, live_transcription_thread, live_transcription_buffer, live_transcription_results
+    global live_faster_whisper_model
+    
+    try:
+        from config import ENABLE_LIVE_TRANSCRIPTION
+        if not ENABLE_LIVE_TRANSCRIPTION:
+            return False
+        
+        if live_transcription_enabled:
+            log_info("[Live] Already running")
+            return True  # Already running
+        
+        # CRASH PREVENTION: Load model in background thread to avoid blocking
+        def load_model_async():
+            try:
+                log_info("[Live] Pre-loading optimized Faster Whisper model...")
+                model = load_live_faster_whisper_model()
+                if model is None:
+                    log_warning("[Live] Model loading failed, will retry on first transcription")
+                else:
+                    log_info("[Live] ✅ Model loaded successfully")
+            except Exception as model_error:
+                log_error(f"[Live] Model loading error: {model_error}")
+        
+        # Start model loading in background (non-blocking)
+        model_loader_thread = threading.Thread(target=load_model_async, daemon=True)
+        model_loader_thread.start()
+        
+        # Reset state
+        try:
+            with live_transcription_lock:
+                live_transcription_buffer = []
+                live_transcription_results = []
+        except Exception as reset_error:
+            log_warning(f"[Live] State reset error: {reset_error}")
+            # Continue anyway
+        
+        live_transcription_enabled = True
+        
+        # Start worker thread with error handling
+        try:
+            live_transcription_thread = threading.Thread(target=live_transcription_worker, daemon=True)
+            live_transcription_thread.start()
+            log_info("[Live] 🎙️ Live transcription worker started")
+        except Exception as thread_error:
+            log_error(f"[Live] Failed to start worker thread: {thread_error}")
+            live_transcription_enabled = False
+            return False
+        
+        log_info("[Live] 🎙️ Live transcription enabled")
+        return True
+        
+    except Exception as e:
+        log_error(f"[Live] Failed to start: {e}")
+        import traceback
+        if not PRODUCTION_MODE:
+            traceback.print_exc()
+        live_transcription_enabled = False
+        return False
+
+def stop_live_transcription():
+    """Stop live transcription and return accumulated results."""
+    global live_transcription_enabled, live_transcription_thread, live_transcription_results
+    
+    try:
+        if not live_transcription_enabled:
+            return ""
+        
+        live_transcription_enabled = False
+        
+        # Wait for thread to finish
+        if live_transcription_thread and live_transcription_thread.is_alive():
+            live_transcription_thread.join(timeout=2.0)
+        
+        # Return accumulated results
+        final_text = ' '.join(live_transcription_results).strip()
+        final_text = ' '.join(final_text.split())  # Clean whitespace
+        
+        # Clear state
+        live_transcription_results = []
+        
+        log_info(f"[Live] 🎙️ Live transcription stopped. Total: {len(final_text)} chars")
+        return final_text
+        
+    except Exception as e:
+        log_warning(f"[Live] Stop error: {e}")
         return ""
 
 def parse_key_shortcut(shortcut_str):
@@ -1508,17 +2136,56 @@ def transcribe_audio_thread(audio_data_np):
 
 
 def audio_callback(indata, frames, time_info, status):
-    """Called by sounddevice for each audio block - with error handling."""
+    """Called by sounddevice for each audio block - with error handling and crash prevention."""
+    global live_transcription_buffer
+    
     try:
         if status:
-            print(f"Audio Stream Status: {status}", file=sys.stderr)
+            if not PRODUCTION_MODE:  # Only log in debug mode
+                print(f"Audio Stream Status: {status}", file=sys.stderr)
+        
         if is_recording:
             try:
-                audio_frames.append(indata.copy())
+                # CRASH PREVENTION: Check if live transcription is enabled first
+                from config import ENABLE_LIVE_TRANSCRIPTION
+                
+                if ENABLE_LIVE_TRANSCRIPTION:
+                    # LIVE MODE: Add to live buffer AND audio_frames (for safety)
+                    if live_transcription_enabled:
+                        try:
+                            with live_transcription_lock:
+                                # Prevent buffer overflow - limit buffer size
+                                if len(live_transcription_buffer) < 100:  # Max 100 frames
+                                    live_transcription_buffer.append(indata.copy())
+                                else:
+                                    # Remove oldest frames if buffer is full
+                                    live_transcription_buffer.pop(0)
+                                    live_transcription_buffer.append(indata.copy())
+                        except Exception as buffer_error:
+                            # Don't crash on buffer errors
+                            if not PRODUCTION_MODE:
+                                log_warning(f"[Live] Buffer error: {buffer_error}")
+                    # Also add to audio_frames as backup
+                    try:
+                        audio_frames.append(indata.copy())
+                    except:
+                        pass
+                else:
+                    # BATCH MODE: Add to audio_frames (default, stable mode)
+                    try:
+                        audio_frames.append(indata.copy())
+                    except Exception as frame_error:
+                        if not PRODUCTION_MODE:
+                            log_warning(f"[Batch] Frame error: {frame_error}")
+                            
             except Exception as e:
-                print(f"[Error] Failed to append audio frame: {e}", file=sys.stderr)
+                # Don't crash on any callback errors
+                if not PRODUCTION_MODE:
+                    print(f"[Error] Failed to append audio frame: {e}", file=sys.stderr)
     except Exception as e:
-        print(f"[Error] Audio callback error: {e}", file=sys.stderr)
+        # Ultimate crash prevention - catch all errors
+        if not PRODUCTION_MODE:
+            print(f"[Error] Audio callback error: {e}", file=sys.stderr)
 
 def pause_media_playback():
     """Pause media playback (Spotify, YouTube, etc.) using AppleScript."""
@@ -1751,12 +2418,29 @@ def start_recording():
         # CRASH PREVENTION: Initialize state variables safely
         try:
             print("[Info] Starting recording...")
+            # Show "Listening" in live mode, "Recording" in batch mode
             try:
-                status_queue.put(f"{APP_ICON_RECORDING} Recording...")
+                from config import ENABLE_LIVE_TRANSCRIPTION
+                if ENABLE_LIVE_TRANSCRIPTION:
+                    status_queue.put(f"{APP_ICON_RECORDING} 🎙️ Listening...")
+                else:
+                    status_queue.put(f"{APP_ICON_RECORDING} Recording...")
             except:
-                pass
+                status_queue.put(f"{APP_ICON_RECORDING} Recording...")
             audio_frames = []
             is_recording = True
+            
+            # Start live transcription if enabled (disabled by default for stability)
+            try:
+                from config import ENABLE_LIVE_TRANSCRIPTION
+                if ENABLE_LIVE_TRANSCRIPTION:
+                    try:
+                        start_live_transcription()
+                    except Exception as live_error:
+                        log_warning(f"[Live] Failed to start live transcription: {live_error}")
+                        # Don't crash - just continue with batch mode
+            except:
+                pass
         except Exception as state_error:
             print(f"[Error] Failed to initialize recording state: {state_error}", file=sys.stderr)
             is_recording = False
@@ -1974,7 +2658,7 @@ def start_recording():
 
 def stop_recording_and_transcribe():
     """Safely stop recording and start transcription with comprehensive error handling."""
-    global is_recording, audio_stream, audio_frames, is_processing, app_instance_global, media_was_paused
+    global is_recording, audio_stream, audio_frames, is_processing, app_instance_global, media_was_paused, live_transcription_text
     
     try:
         if not is_recording:
@@ -1983,6 +2667,17 @@ def stop_recording_and_transcribe():
 
         print("[Info] Recording stopped.")
         is_recording = False  # Set this FIRST to prevent callback issues
+        
+        # Stop live transcription if enabled and get accumulated results
+        live_transcription_text = ""
+        try:
+            from config import ENABLE_LIVE_TRANSCRIPTION
+            if ENABLE_LIVE_TRANSCRIPTION:
+                live_transcription_text = stop_live_transcription()
+                if live_transcription_text:
+                    log_info(f"[Live] Final transcription: {live_transcription_text[:100]}...")
+        except Exception as live_error:
+            log_warning(f"[Live] Stop error: {live_error}")
         
         # Safely stop audio stream
         if audio_stream is not None:
@@ -2004,6 +2699,54 @@ def stop_recording_and_transcribe():
         except Exception as e:
             print(f"[Warning] Failed to update menu: {e}", file=sys.stderr)
         
+        # LIVE MODE ONLY: If live transcription is enabled, use only live results (skip batch completely)
+        try:
+            from config import ENABLE_LIVE_TRANSCRIPTION, LIVE_PASTE_INCREMENTALLY
+            if ENABLE_LIVE_TRANSCRIPTION:
+                log_info("[Live] Live mode enabled - using live transcription results only (batch disabled)")
+                
+                # Use live transcription results if available
+                if live_transcription_text and live_transcription_text.strip():
+                    log_info(f"[Live] ✅ Final result: {live_transcription_text[:100]}...")
+                    
+                    # If incremental paste was enabled, text was already pasted during recording
+                    # But we still need to ensure final text is in clipboard and queue for final paste
+                    if not LIVE_PASTE_INCREMENTALLY:
+                        # Only paste now if incremental paste was disabled
+                        transcription_queue.put(live_transcription_text)
+                    else:
+                        # Even with incremental paste, put in queue to ensure clipboard has final text
+                        # and trigger any final paste if needed
+                        transcription_queue.put(live_transcription_text)
+                        
+                        # Also ensure clipboard has the complete final text
+                        try:
+                            pyperclip.copy(live_transcription_text)
+                            log_info("[Live] ✅ Final text copied to clipboard")
+                        except:
+                            pass
+                else:
+                    log_warning("[Live] No live transcription results available")
+                    # Don't fall back to batch - just show empty result
+                    transcription_queue.put("")
+                
+                # Clear audio frames (not needed in live mode)
+                audio_frames = []
+                is_processing = False
+                
+                # Update menu
+                try:
+                    if app_instance_global:
+                        app_instance_global.update_record_menu()
+                except:
+                    pass
+                
+                return  # Exit early - NO BATCH PROCESSING
+        except Exception as live_check_error:
+            log_warning(f"[Live] Error checking live mode: {live_check_error}")
+            # Only continue to batch if live mode check completely fails
+        
+        # BATCH MODE (only if live transcription is disabled)
         # Check if we have audio data
         if not audio_frames or len(audio_frames) == 0:
             print("[Warning] No audio frames captured.")
@@ -2167,6 +2910,21 @@ def on_press(key):
                 pass
     
     if is_trigger:
+        # DEBOUNCE: Prevent double-click/multiple rapid presses
+        import time
+        current_time = time.time()
+        if not hasattr(on_press, 'last_trigger_time'):
+            on_press.last_trigger_time = 0
+        if not hasattr(on_press, 'trigger_debounce_delay'):
+            on_press.trigger_debounce_delay = 0.3  # 300ms debounce
+        
+        # Skip if trigger was pressed too recently (double-click protection)
+        if current_time - on_press.last_trigger_time < on_press.trigger_debounce_delay:
+            print("[Input] Trigger key debounced (double-click protection)")
+            return
+        
+        on_press.last_trigger_time = current_time
+        
         if not trigger_key_held:
             trigger_key_held = True
             print("[Input] Trigger key pressed.")
@@ -2192,8 +2950,15 @@ def on_press(key):
                         audio_stream = None
                 audio_frames = []
 
-            # Reset status immediately
-            status_queue.put(f"{APP_ICON_RECORDING} Recording...")
+            # Reset status immediately - show "Listening" in live mode
+            try:
+                from config import ENABLE_LIVE_TRANSCRIPTION
+                if ENABLE_LIVE_TRANSCRIPTION:
+                    status_queue.put(f"{APP_ICON_RECORDING} 🎙️ Listening...")
+                else:
+                    status_queue.put(f"{APP_ICON_RECORDING} Recording...")
+            except:
+                status_queue.put(f"{APP_ICON_RECORDING} Recording...")
             
             # Clear any pending items in queues
             try:
@@ -2330,15 +3095,30 @@ class WhisperStatusBarApp(rumps.App):
         self.mode_menu = rumps.MenuItem("Processing Mode")
         self.audio_menu = rumps.MenuItem("🎤 Audio Settings")
         self.faster_whisper_menu = rumps.MenuItem("⚡ Faster Whisper", callback=self.toggle_faster_whisper)
+        try:
+            from config import ENABLE_LIVE_TRANSCRIPTION
+            # Show "(Default)" in menu title when batch mode is default (live disabled)
+            menu_title = "🎙️ Live Transcription" if ENABLE_LIVE_TRANSCRIPTION else "🎙️ Live Transcription (Off)"
+            self.live_transcription_menu = rumps.MenuItem(menu_title, callback=self.toggle_live_transcription)
+            self.live_transcription_menu.state = ENABLE_LIVE_TRANSCRIPTION
+        except:
+            # Default to batch mode (live disabled) for stability
+            self.live_transcription_menu = rumps.MenuItem("🎙️ Live Transcription (Off)", callback=self.toggle_live_transcription)
+            self.live_transcription_menu.state = False
         self.record_menu = rumps.MenuItem("🎤 Start Recording (Default)", callback=self.toggle_recording)
         
         # Add keyboard shortcuts menu
         self.shortcuts_menu = rumps.MenuItem("Keyboard Shortcuts")
+        
+        # Add restart menu item
+        self.restart_menu = rumps.MenuItem("🔄 Restart", callback=self.restart_application)
+        
         self.menu = [
             self.start_menu,
             self.stop_menu,
             None,  # Separator
             self.record_menu,
+            self.live_transcription_menu,
             None,  # Separator
             rumps.MenuItem("Keyboard: Hold Option Key", callback=None),  # Info item
             None,  # Separator
@@ -2347,7 +3127,8 @@ class WhisperStatusBarApp(rumps.App):
             self.audio_menu,
             self.faster_whisper_menu,
             self.shortcuts_menu,
-            None  # Separator
+            None,  # Separator
+            self.restart_menu
         ]
         self.create_model_submenu()
         self.create_mode_submenu()
@@ -2423,6 +3204,30 @@ class WhisperStatusBarApp(rumps.App):
         if current_model_id:
             model_name = selected_model_name
             threading.Thread(target=lambda: self.change_model(None, model_name=model_name), daemon=True).start()
+
+    def toggle_live_transcription(self, sender):
+        """Toggle live/streaming transcription on/off.
+        
+        Live Mode (Default): Real-time transcription as you speak, text appears incrementally
+        Batch Mode: Traditional mode - transcribes entire recording after you stop
+        """
+        try:
+            import config
+            config.ENABLE_LIVE_TRANSCRIPTION = not config.ENABLE_LIVE_TRANSCRIPTION
+            sender.state = config.ENABLE_LIVE_TRANSCRIPTION
+            
+            if config.ENABLE_LIVE_TRANSCRIPTION:
+                print("[Info] 🎙️ Live transcription enabled (DEFAULT) - text appears as you speak")
+                status_queue.put(f"{APP_ICON_SUCCESS} 🎙️ Live Mode (Default)")
+                # Update menu title to show it's the default
+                sender.title = "🎙️ Live Transcription (Default)"
+            else:
+                print("[Info] Live transcription disabled - using batch mode (traditional)")
+                status_queue.put(f"{APP_ICON_IDLE} Batch Mode")
+                # Update menu title
+                sender.title = "🎙️ Live Transcription"
+        except Exception as e:
+            print(f"[Error] Failed to toggle live transcription: {e}", file=sys.stderr)
 
     def create_model_submenu(self):
         """Creates or updates the model selection submenu with grouping and indicators."""
@@ -3085,6 +3890,7 @@ class WhisperStatusBarApp(rumps.App):
                 
                 # ALWAYS copy to clipboard first (this works even if paste fails)
                 pyperclip.copy(transcription)
+                time.sleep(0.3)  # Wait for clipboard to be ready
 
                 # Verify copy worked
                 clipboard_check = pyperclip.paste()
@@ -3093,6 +3899,7 @@ class WhisperStatusBarApp(rumps.App):
                 else:
                     print("[Warning] Clipboard copy may have failed, retrying...")
                     pyperclip.copy(transcription)
+                    time.sleep(0.2)
                 
                 # Show notification with transcribed text (so user knows what was transcribed)
                 text_preview = transcription[:80] + "..." if len(transcription) > 80 else transcription
@@ -3136,12 +3943,14 @@ class WhisperStatusBarApp(rumps.App):
                                 
                                 -- Activate the application to ensure it has focus
                                 tell process frontApp
+                                    activate
                                     set frontmost to true
-                                    delay 0.1
+                                    delay 0.5
                                     
                                     -- Paste at cursor position (Cmd+V)
                                     -- This will paste wherever the text cursor is in the active input field
-                                    keystroke "v" using command down
+                                    keystroke "v" using {command down}
+                                    delay 0.2
                                 end tell
                             end tell
                         '''
@@ -3233,31 +4042,12 @@ class WhisperStatusBarApp(rumps.App):
 
                 if paste_success:
                     log_info("[Info] ✅ Text pasted directly at cursor position")
-                    # Minimal notification (production mode)
-                    try:
-                        from config import SHOW_NOTIFICATIONS
-                        if SHOW_NOTIFICATIONS:
-                            rumps.notification(
-                                title="✅ Pasted", 
-                                subtitle="Text inserted", 
-                                message=f"{text_preview}"
-                            )
-                    except:
-                        pass
+                    # No notification - text is pasted, user can see it
                 else:
                     # If direct paste failed, text is still in clipboard as backup
                     log_info("[Info] ⚠️  Direct paste failed - text is in clipboard (press Cmd+V if needed)")
-                    # Only show notification if paste completely failed
-                    try:
-                        from config import SHOW_NOTIFICATIONS
-                        if SHOW_NOTIFICATIONS:
-                            rumps.notification(
-                                title="📋 In Clipboard", 
-                                subtitle="Press Cmd+V to paste", 
-                                message=f"{text_preview}"
-                            )
-                    except:
-                        pass
+                    # Paste failed - text is in clipboard, no notification needed
+                    log_info("[Info] Paste failed, text is in clipboard (user can paste manually)")
 
             except Exception as paste_error:
                 print(f"[Error] Failed to copy or simulate paste: {paste_error}", file=sys.stderr)
@@ -3266,13 +4056,13 @@ class WhisperStatusBarApp(rumps.App):
                     try:
                          pyperclip.copy(transcription)
                          print("[Info] Retrying copy to clipboard after paste error.")
-                         rumps.notification(title="Transcription Copied", subtitle="Paste failed", message="Copied to clipboard instead.")
+                         # No notification - text is in clipboard
                     except Exception as copy_error:
                          print(f"[Error] Could not copy transcription to clipboard after paste failure: {copy_error}", file=sys.stderr)
                          self.title = f"{APP_ICON_ERROR} Copy Failed"
                 else:
-                     # Copy succeeded, but paste failed
-                     rumps.notification(title="Transcription Copied", subtitle="Paste failed", message="Copied to clipboard instead.")
+                     # Copy succeeded, but paste failed - no notification
+                     log_info("[Info] Text copied to clipboard (paste failed)")
                      self.title = f"{APP_ICON_ERROR} Paste Failed"
 
 
@@ -3298,6 +4088,63 @@ class WhisperStatusBarApp(rumps.App):
             print("[Warning] AppKit not available - running with dock icon")
         except Exception as e:
             print(f"[Warning] Could not configure dock visibility: {e}")
+
+    def restart_application(self, _):
+        """Restart the application."""
+        global keyboard_listener, audio_stream, is_recording
+        
+        try:
+            print("[Info] Restart requested...")
+            status_queue.put(f"{APP_ICON_LOADING} Restarting...")
+            
+            # Stop recording if active
+            if is_recording:
+                try:
+                    stop_recording_and_transcribe()
+                except:
+                    pass
+            
+            # Stop keyboard listener
+            if keyboard_listener:
+                try:
+                    keyboard_listener.stop()
+                except:
+                    pass
+            
+            # Close audio stream
+            if audio_stream:
+                try:
+                    if audio_stream.active:
+                        audio_stream.stop()
+                    audio_stream.close()
+                except:
+                    pass
+            
+            # Get script directory
+            import os
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            restart_script = os.path.join(script_dir, "run_whisperbar.sh")
+            
+            # Execute restart script in background
+            import subprocess
+            subprocess.Popen(
+                ["/bin/bash", restart_script, "restart"],
+                cwd=script_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            
+            # Quit current instance
+            print("[Info] Restarting application...")
+            import time
+            time.sleep(0.5)  # Brief delay to allow script to start
+            rumps.quit_application()
+            
+        except Exception as e:
+            print(f"[Error] Failed to restart: {e}", file=sys.stderr)
+            status_queue.put(f"{APP_ICON_ERROR} Restart Failed")
+            import traceback
+            traceback.print_exc()
 
     def quit_application(self, _):
         """Cleanly stop listener and quit."""

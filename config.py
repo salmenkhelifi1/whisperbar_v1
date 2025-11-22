@@ -110,6 +110,25 @@ VAD_SPEECH_PAD_BEFORE = 0.3  # Padding before speech (seconds) - increased for b
 VAD_SPEECH_PAD_AFTER = 0.2   # Padding after speech (seconds)
 VAD_SHOW_FEEDBACK = False    # Show VAD detection in status bar (PRODUCTION: Disabled for cleaner UI)
 
+# --- Live/Streaming Transcription Configuration ---
+# DEFAULT MODE: Batch transcription is now the default (stable, reliable)
+# Toggle via menu "🎙️ Live Transcription" to switch between live and batch modes
+ENABLE_LIVE_TRANSCRIPTION = False  # DEFAULT: Live transcription disabled (use batch mode for stability)
+LIVE_CHUNK_DURATION = 1.5  # Process audio chunks every N seconds (lower = faster but more CPU) - optimized for speed
+LIVE_MIN_SPEECH_DURATION = 0.4  # Minimum speech duration before transcribing (seconds) - lower for faster response
+LIVE_SILENCE_THRESHOLD = 0.9  # Silence threshold for VAD in live mode (0.1-0.9, higher = less sensitive, more aggressive silence detection)
+LIVE_PASTE_INCREMENTALLY = True  # Paste text as it's transcribed (True) or wait until end (False)
+LIVE_PASTE_DELAY = 0.2  # Delay before pasting each chunk (seconds) - reduced for faster response
+LIVE_SKIP_SILENCE = True  # Skip processing when silence is detected (saves CPU, smarter)
+LIVE_MIN_SILENCE_DURATION = 0.3  # Minimum silence duration to skip processing (seconds)
+
+# --- Hybrid Model Configuration for Intelligence + Speed ---
+# Uses a smart hybrid approach: faster model for quick response, better model for accuracy
+LIVE_USE_HYBRID_MODELS = True  # Enable hybrid model approach (tiny for speed + medium for accuracy)
+LIVE_PRIMARY_MODEL = "medium.en"  # Primary model for accuracy (medium.en = best balance of speed + intelligence)
+LIVE_FALLBACK_MODEL = "base.en"  # Fallback if medium is too slow (base.en = faster, still good)
+LIVE_USE_FAST_FIRST_PASS = False  # Use tiny for first pass, then refine with medium (experimental, may be slower)
+
 # --- Processing Mode Configuration ---
 # Three clean processing modes:
 # 1. Traditional: Proven VAD processing (baseline)
